@@ -1,0 +1,1 @@
+A Simple bonding curve inspired from uniswap .
