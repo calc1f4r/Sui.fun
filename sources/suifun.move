@@ -118,6 +118,14 @@ module suifun::suifun {
         by: address,
     }
 
+    /// Event emitted when admin withdraws SUI from a graduated curve
+    public struct CurveFundsWithdrawn has copy, drop {
+        curve_id: u64,
+        by: address,
+        recipient: address,
+        sui_amount: u64,
+    }
+
     /// Initialize the protocol with default configuration
     /// This function is called once when the module is deployed 
     /// The init function does not take anything except the context so constant values are used
@@ -400,6 +408,36 @@ module suifun::suifun {
             new_real_token_reserves: curve.real_token_reserves,
             new_real_sui_reserves: curve.real_sui_reserves,
         });
+    }
+
+    ///////////////////////////// ADMIN FUNCTIONS /////////////////////////////
+
+    /// Withdraw all SUI from a graduated curve to a recipient (admin only)
+    public entry fun withdraw(
+        _admin_cap: &AdminCap,
+        config: &mut GlobalConfig,
+        curve_id: u64,
+        recipient: address,
+        ctx: &mut TxContext,
+    ) {
+        assert!(has_curve(config, curve_id), E_CURVE_NOT_FOUND);
+        let curve = borrow_curve_mut(config, curve_id)
+        ;
+        assert!(curve.graduated, E_INVALID_CURVE_STATE);
+
+        let amount = balance::value(&curve.sui_vault);
+        assert!(amount > 0, E_ZERO_AMOUNT);
+
+        // Drain SUI vault and reset real_sui_reserves
+        let sui_balance = balance::split(&mut curve.sui_vault, amount);
+        let sui_coin = coin::from_balance(sui_balance, ctx);
+        curve.real_sui_reserves = 0;
+
+        // Transfer to recipient
+        sui::transfer::public_transfer(sui_coin, recipient);
+
+        // Emit withdrawal event
+        event::emit(CurveFundsWithdrawn { curve_id, by: ctx.sender(), recipient, sui_amount: amount });
     }
 
     /// Sell tokens for SUI using bonding curve pricing
