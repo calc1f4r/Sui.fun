@@ -8,6 +8,7 @@ module suifun::suifun {
     use sui::sui::SUI;
     use sui::event;
     use suifun::utils;
+    
 
     // Error codes
     const E_INVALID_FEE_BASIS: u64 = 1;
@@ -71,6 +72,50 @@ module suifun::suifun {
     public struct AuthorityUpdated has copy, drop {
         old_authority: address,
         new_authority: address,
+    }
+
+    /// Event emitted when a new token launches
+    public struct TokenLaunched has copy, drop {
+        curve_id: u64,
+        creator: address,
+        name: String,
+        symbol: String,
+        description: Option<String>,
+        icon_url: Option<Url>,
+        initial_virtual_token_reserves: u64,
+        initial_virtual_sui_reserves: u64,
+        initial_real_token_reserves: u64,
+        token_total_supply: u64,
+    }
+
+    /// Event emitted when tokens are bought from a curve
+    public struct TokensBought has copy, drop {
+        curve_id: u64,
+        buyer: address,
+        sui_amount: u64,
+        fee_amount: u64,
+        sui_deposited: u64,
+        tokens_out: u64,
+        new_real_token_reserves: u64,
+        new_real_sui_reserves: u64,
+    }
+
+    /// Event emitted when tokens are sold to a curve
+    public struct TokensSold has copy, drop {
+        curve_id: u64,
+        seller: address,
+        token_amount: u64,
+        sui_out: u64,
+        fee_amount: u64,
+        sui_to_seller: u64,
+        new_real_token_reserves: u64,
+        new_real_sui_reserves: u64,
+    }
+
+    /// Event emitted when a bonding curve graduates (token vault depleted)
+    public struct CurveGraduated has copy, drop {
+        curve_id: u64,
+        by: address,
     }
 
     /// Initialize the protocol with default configuration
@@ -220,6 +265,20 @@ module suifun::suifun {
         let curve_id = config.next_curve_id;
         dynamic_field::add<u64, SUICURVE>(&mut config.id, curve_id, curve);
         config.next_curve_id = curve_id + 1;
+        
+        // Emit token launch event
+        event::emit(TokenLaunched {
+            curve_id,
+            creator: ctx.sender(),
+            name,
+            symbol,
+            description,
+            icon_url,
+            initial_virtual_token_reserves: config.initial_virtual_token_reserves,
+            initial_virtual_sui_reserves: config.initial_virtual_sui_reserves,
+            initial_real_token_reserves: config.initial_real_token_reserves,
+            token_total_supply: config.token_total_supply,
+        });
     }
       /// Check whether a curve exists
     public fun has_curve(config: &GlobalConfig, curve_id: u64): bool {
@@ -288,38 +347,59 @@ module suifun::suifun {
         let fee_amount = utils::get_fee_amount(fee_basis_points, sui_amount);
         let sui_for_trade = sui_amount - fee_amount;
         
-        // Calculate tokens to mint using bonding curve formula from utils
+        // Use effective reserves for pricing: virtual adjusted by real reserves
         let virtual_sui_reserves = curve.virtual_sui_reserves + curve.real_sui_reserves;
         let virtual_token_reserves = curve.virtual_token_reserves - curve.real_token_reserves;
+        let tokens_out = utils::tokens_for_sui(sui_for_trade, virtual_sui_reserves, virtual_token_reserves);
+
         
-        // Calculate tokens received for SUI input using shared utils function
-        let tokens_to_mint = utils::tokens_for_sui(sui_for_trade, virtual_sui_reserves, virtual_token_reserves);
-        assert!(tokens_to_mint >= min_tokens_out, E_INVALID_SLIPPAGE);
-        assert!(tokens_to_mint > 0, E_ZERO_AMOUNT);
+
+        // assert_eq!(t1, t2)
+        assert!(tokens_out >= min_tokens_out, E_INVALID_SLIPPAGE);
+        assert!(tokens_out > 0, E_ZERO_AMOUNT);
         
-        // Ensure we have enough tokens in the vault
-        assert!(balance::value(&curve.token_vault) >= tokens_to_mint, E_INSUFFICIENT_BALANCE);
+        // Ensure we have enough tokens in the vault as in real token reserves
+        assert!(curve.real_token_reserves >= tokens_out, E_INVALID_CURVE_STATE);
         
         // Update curve state with overflow protection
+        // Only real reserves change with trades; virtual reserves remain constant
+        curve.real_token_reserves = curve.real_token_reserves - tokens_out;
         curve.real_sui_reserves = curve.real_sui_reserves + sui_for_trade;
-        curve.real_token_reserves = curve.real_token_reserves + tokens_to_mint;
         
-        // Extract tokens from vault
-        let tokens_balance = balance::split(&mut curve.token_vault, tokens_to_mint);
-        let tokens_coin = coin::from_balance(tokens_balance, ctx);
-        
+
+
+        if(curve.real_token_reserves==0){
+            curve.graduated=true;
+            // Emit curve graduated event
+            event::emit(CurveGraduated { curve_id, by: ctx.sender() });
+        };
+
         // Handle fee and payment properly
-        let fee_coin = coin::split(&mut payment, fee_amount, ctx);
+        sui::transfer::public_transfer(
+            coin::split(&mut payment, fee_amount, ctx),
+            fee_recipient,
+        );
         
         // Store remaining SUI payment in the curve's SUI vault
-        let sui_balance = coin::into_balance(payment);
-        balance::join(&mut curve.sui_vault, sui_balance);
-        
-        // Transfer fee to fee recipient
-        transfer::public_transfer(fee_coin, fee_recipient);
+        balance::join(&mut curve.sui_vault, coin::into_balance(payment));
         
         // Transfer tokens to buyer
-        transfer::public_transfer(tokens_coin, ctx.sender());
+        sui::transfer::public_transfer(
+            coin::from_balance(balance::split(&mut curve.token_vault, tokens_out), ctx),
+            ctx.sender(),
+        );
+
+        // Emit buy event
+        event::emit(TokensBought {
+            curve_id,
+            buyer: ctx.sender(),
+            sui_amount,
+            fee_amount,
+            sui_deposited: sui_for_trade,
+            tokens_out,
+            new_real_token_reserves: curve.real_token_reserves,
+            new_real_sui_reserves: curve.real_sui_reserves,
+        });
     }
 
     /// Sell tokens for SUI using bonding curve pricing
@@ -342,10 +422,8 @@ module suifun::suifun {
         let curve = borrow_curve_mut(config, curve_id);
         assert!(!curve.graduated, E_CURVE_GRADUATED);
         
-        // Calculate SUI to return using bonding curve formula from utils
-        let virtual_sui_reserves = curve.virtual_sui_reserves + curve.real_sui_reserves;
-        let virtual_token_reserves = curve.virtual_token_reserves - curve.real_token_reserves;
-        let sui_out = utils::sell_quote(token_amount, virtual_sui_reserves, virtual_token_reserves);
+
+        let sui_out = utils::sell_quote(token_amount, curve.virtual_sui_reserves, curve.virtual_token_reserves);
         assert!(sui_out >= min_sui_out, E_INVALID_SLIPPAGE);
         assert!(sui_out > 0, E_ZERO_AMOUNT);
         
@@ -360,9 +438,9 @@ module suifun::suifun {
         
         // Update curve state with underflow protection
         assert!(curve.real_sui_reserves >= sui_out, E_INSUFFICIENT_BALANCE);
-        assert!(curve.real_token_reserves >= token_amount, E_INSUFFICIENT_BALANCE);
+        // Selling returns tokens to the curve and extracts SUI from it
         curve.real_sui_reserves = curve.real_sui_reserves - sui_out;
-        curve.real_token_reserves = curve.real_token_reserves - token_amount;
+        curve.real_token_reserves = curve.real_token_reserves + token_amount;
         
         // Return tokens to vault
         let token_balance = coin::into_balance(tokens);
@@ -381,6 +459,18 @@ module suifun::suifun {
         
         // Transfer remaining SUI to seller
         transfer::public_transfer(user_sui_coin, ctx.sender());
+
+        // Emit sell event
+        event::emit(TokensSold {
+            curve_id,
+            seller: ctx.sender(),
+            token_amount,
+            sui_out,
+            fee_amount,
+            sui_to_seller: sui_for_user,
+            new_real_token_reserves: curve.real_token_reserves,
+            new_real_sui_reserves: curve.real_sui_reserves,
+        });
     }
 
     ///////////////////////////// HELPER FUNCTIONS /////////////////////////////
@@ -413,10 +503,8 @@ module suifun::suifun {
         assert!(has_curve(config, curve_id), E_CURVE_NOT_FOUND);
         let curve = borrow_curve(config, curve_id);
         
-        let virtual_sui_reserves = curve.virtual_sui_reserves + curve.real_sui_reserves;
-        let virtual_token_reserves = curve.virtual_token_reserves - curve.real_token_reserves;
         
-        utils::tokens_for_sui(sui_amount, virtual_sui_reserves, virtual_token_reserves)
+        utils::tokens_for_sui(sui_amount, curve.virtual_sui_reserves, curve.virtual_token_reserves)
     }
 
     /// Get sell quote for a specific curve - how much SUI received for selling tokens
@@ -428,10 +516,8 @@ module suifun::suifun {
         assert!(has_curve(config, curve_id), E_CURVE_NOT_FOUND);
         let curve = borrow_curve(config, curve_id);
         
-        let virtual_sui_reserves = curve.virtual_sui_reserves + curve.real_sui_reserves;
-        let virtual_token_reserves = curve.virtual_token_reserves - curve.real_token_reserves;
         
-        utils::sell_quote(token_amount, virtual_sui_reserves, virtual_token_reserves)
+        utils::sell_quote(token_amount, curve.virtual_sui_reserves, curve.virtual_token_reserves)
     }
 
     /// Get buy quote with fee included - total SUI needed including fees
