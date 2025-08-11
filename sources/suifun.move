@@ -6,6 +6,7 @@ module suifun::suifun {
     use sui::balance::{Self, Balance};
     use sui::dynamic_field;
     use sui::sui::SUI;
+    use sui::event;
     use suifun::utils;
 
     // Error codes
@@ -20,6 +21,8 @@ module suifun::suifun {
     const E_INVALID_SLIPPAGE: u64 = 9;
     const E_INVALID_CURVE_STATE: u64 = 10;
 
+
+    const MAX_FEE_BASIS_POINTS: u16 = 10000;
     /// Admin capability for managing the protocol
     public struct AdminCap has key {
         id: UID,
@@ -44,7 +47,7 @@ module suifun::suifun {
         id: UID,
         authority: address,
         fee_recipient: address,
-        init_virtual_token_reserves: u64,
+        initial_virtual_token_reserves: u64,
         initial_virtual_sui_reserves: u64,
         initial_real_token_reserves: u64,
         token_total_supply: u64,
@@ -53,33 +56,41 @@ module suifun::suifun {
         
     }
 
+    /// Event emitted when the global configuration is updated
+    public struct ConfigUpdated has copy, drop {
+        authority: address,
+        fee_recipient: address,
+        initial_virtual_token_reserves: u64,
+        initial_virtual_sui_reserves: u64,
+        initial_real_token_reserves: u64,
+        token_total_supply: u64,
+        fee_basis_points: u16,
+    }
+
+    /// Event emitted when the authority is updated
+    public struct AuthorityUpdated has copy, drop {
+        old_authority: address,
+        new_authority: address,
+    }
+
     /// Initialize the protocol with default configuration
     /// This function is called once when the module is deployed 
     /// The init function does not take anything except the context so constant values are used
     fun init(ctx: &mut TxContext) {
-
-        // Some default params for the function to work 
-        let init_virtual_token_reserves = 1_000_000_000_000; 
-        let initial_virtual_sui_reserves = 30_000_000_000; 
-        let initial_real_token_reserves = 0;
-        let token_total_supply = 1_000_000_000_000_000; 
-        let fee_basis = 100; 
         let sender = ctx.sender();
-
-       
         let global_config = GlobalConfig {
             id: object::new(ctx),
             authority: sender,
             fee_recipient: sender,
-            init_virtual_token_reserves,
-            initial_virtual_sui_reserves,
-            initial_real_token_reserves,
-            token_total_supply,
-            fee_basis_points: fee_basis,
+            initial_virtual_token_reserves: 0,
+            initial_virtual_sui_reserves: 0,
+            initial_real_token_reserves: 0,
+            token_total_supply: 0,
+            fee_basis_points: 100,
             next_curve_id: 1u64,
         };
         
-       
+       // share the global config object so that anyone can create bonding curves
         sui::transfer::share_object(global_config);
         
         let admin_cap = AdminCap {
@@ -93,44 +104,53 @@ module suifun::suifun {
     public entry fun update_config(
     _admin_cap: &AdminCap,
     config: &mut GlobalConfig,
-    mut new_fee_basis: Option<u16>,
-    mut new_fee_recipient: Option<address>,
-    mut new_init_virtual_token_reserves: Option<u64>,
-    mut new_initial_virtual_sui_reserves: Option<u64>,
-    mut new_token_total_supply: Option<u64>,
+    new_fee_basis: u16,
+    new_fee_recipient: address,
+    new_initial_virtual_token_reserves: u64,
+    new_initial_virtual_sui_reserves: u64,
+    new_initial_real_token_reserves: u64,
+    new_token_total_supply: u64,
 ) {
 
+    // Validate and update virtual token reserves with lower bound check
+    assert!(new_initial_virtual_token_reserves > 0, E_INVALID_VIRTUAL_TOKEN_RESERVES);
+    assert!(new_token_total_supply > 0, E_INVALID_TOKEN_TOTAL_SUPPLY);
 
-    if (option::is_some(&new_init_virtual_token_reserves)) {
-        let new_value = option::extract(&mut new_init_virtual_token_reserves);
-        assert!(new_value > 0, E_INVALID_VIRTUAL_TOKEN_RESERVES);
-        config.init_virtual_token_reserves = new_value;
-    };
+    assert!(new_token_total_supply>new_initial_real_token_reserves, E_INVALID_TOKEN_TOTAL_SUPPLY);
+    assert!(new_initial_virtual_token_reserves>new_initial_real_token_reserves, E_INVALID_VIRTUAL_TOKEN_RESERVES);
+    assert!(new_fee_basis <= MAX_FEE_BASIS_POINTS, E_INVALID_FEE_BASIS);
+
+
+
+    config.initial_virtual_token_reserves = new_initial_virtual_token_reserves;
+
+
+    config.token_total_supply = new_token_total_supply;
 
     // Validate and update virtual SUI reserves with lower bound check
-    if (option::is_some(&new_initial_virtual_sui_reserves)) {
-        let new_value = option::extract(&mut new_initial_virtual_sui_reserves);
-        assert!(new_value > 0, E_INVALID_VIRTUAL_SUI_RESERVES);
-        config.initial_virtual_sui_reserves = new_value;
-    };
+    assert!(new_initial_virtual_sui_reserves > 0, E_INVALID_VIRTUAL_SUI_RESERVES);
+    
+    config.initial_virtual_sui_reserves = new_initial_virtual_sui_reserves;
 
     // Validate and update token total supply with lower bound check
-    if (option::is_some(&new_token_total_supply)) {
-        let new_value = option::extract(&mut new_token_total_supply);
-        assert!(new_value > 0, E_INVALID_TOKEN_TOTAL_SUPPLY);
-        config.token_total_supply = new_value;
-    };
+    config.token_total_supply = new_token_total_supply;
 
-    if (option::is_some(&new_fee_basis)) {
-        let new_value = option::extract(&mut new_fee_basis);
-        assert!(new_value <= 10000, E_INVALID_FEE_BASIS);
-        config.fee_basis_points = new_value;
-    };
+    // Validate and update fee basis points
+    config.fee_basis_points = new_fee_basis;
 
-    if (option::is_some(&new_fee_recipient)) {
-        let new_value = option::extract(&mut new_fee_recipient);
-        config.fee_recipient = new_value;
-    };
+    // Update fee recipient
+    config.fee_recipient = new_fee_recipient;
+
+    // Emit config updated event
+    event::emit(ConfigUpdated {
+        authority: config.authority,
+        fee_recipient: config.fee_recipient,
+        initial_virtual_token_reserves: config.initial_virtual_token_reserves,
+        initial_virtual_sui_reserves: config.initial_virtual_sui_reserves,
+        initial_real_token_reserves: config.initial_real_token_reserves,
+        token_total_supply: config.token_total_supply,
+        fee_basis_points: config.fee_basis_points,
+    });
 }
 
 
@@ -139,7 +159,15 @@ module suifun::suifun {
         config: &mut GlobalConfig,
         new_authority: address,
     ) {
+        let old_authority = config.authority;
         config.authority = new_authority;
+        
+        // Emit authority updated event
+        event::emit(AuthorityUpdated {
+            old_authority,
+            new_authority,
+        });
+        
         sui::transfer::transfer(admin_cap, new_authority);
     }
 
@@ -147,9 +175,8 @@ module suifun::suifun {
     
 
 
-    /// Create a new curve and token (admin only for security)
+    /// Create a new curve and token 
     public fun create_curve(
-        _admin_cap: &AdminCap,
         config: &mut GlobalConfig,
         otw: SUIFUNTOKEN,
         name: String,
@@ -180,7 +207,7 @@ module suifun::suifun {
             id: object::new(ctx),
             token_vault: token_balance,
             sui_vault: balance::zero<SUI>(),
-            virtual_token_reserves: config.init_virtual_token_reserves,
+            virtual_token_reserves: config.initial_virtual_token_reserves,
             virtual_sui_reserves: config.initial_virtual_sui_reserves,
             real_token_reserves: config.initial_real_token_reserves,
             real_sui_reserves: 0,
@@ -209,31 +236,31 @@ module suifun::suifun {
         dynamic_field::borrow_mut<u64, SUICURVE>(&mut config.id, curve_id)
     }
 
-    /// Remove a curve (admin-only) - only allows removing curves with zero balance
-    public entry fun remove_curve(_admin_cap: &AdminCap, config: &mut GlobalConfig, curve_id: u64) {
-        // This will fail if the field doesn't exist
-        let removed = dynamic_field::remove<u64, SUICURVE>(&mut config.id, curve_id);
-        // Since this is an entry function, we need to destroy the curve properly
-        let SUICURVE { 
-            id, 
-            token_vault, 
-            sui_vault,
-            virtual_token_reserves: _, 
-            virtual_sui_reserves: _, 
-            real_token_reserves: _, 
-            real_sui_reserves, 
-            token_total_supply: _, 
-            graduated: _ 
-        } = removed;
+    // Remove a curve (admin-only) - only allows removing curves with zero balance
+    // public entry fun remove_curve(_admin_cap: &AdminCap, config: &mut GlobalConfig, curve_id: u64) {
+    //     // This will fail if the field doesn't exist
+    //     let removed = dynamic_field::remove<u64, SUICURVE>(&mut config.id, curve_id);
+    //     // Since this is an entry function, we need to destroy the curve properly
+    //     let SUICURVE { 
+    //         id, 
+    //         token_vault, 
+    //         sui_vault,
+    //         virtual_token_reserves: _, 
+    //         virtual_sui_reserves: _, 
+    //         real_token_reserves: _, 
+    //         real_sui_reserves, 
+    //         token_total_supply: _, 
+    //         graduated: _ 
+    //     } = removed;
         
-        // Security check: only allow removing curves with zero real SUI reserves
-        assert!(real_sui_reserves == 0, E_INVALID_CURVE_STATE);
+    //     // Security check: only allow removing curves with zero real SUI reserves
+    //     assert!(real_sui_reserves == 0, E_INVALID_CURVE_STATE);
         
-        // Properly handle the vaults by destroying the balances (must be zero)
-        balance::destroy_zero(token_vault);
-        balance::destroy_zero(sui_vault);
-        object::delete(id);
-    }
+    //     // Properly handle the vaults by destroying the balances (must be zero)
+    //     balance::destroy_zero(token_vault);
+    //     balance::destroy_zero(sui_vault);
+    //     object::delete(id);
+    // }
 
     ///////////////////////////// TRADING FUNCTIONS /////////////////////////////
 
@@ -445,7 +472,7 @@ module suifun::suifun {
     public struct GlobalConfigView has copy{
            authority: address,
         fee_recipient: address,
-        init_virtual_token_reserves: u64,
+        initial_virtual_token_reserves: u64,
         initial_virtual_sui_reserves: u64,
         initial_real_token_reserves: u64,
         token_total_supply: u64,
@@ -455,7 +482,7 @@ module suifun::suifun {
         GlobalConfigView {
             authority: config.authority,
             fee_recipient: config.fee_recipient,
-            init_virtual_token_reserves: config.init_virtual_token_reserves,
+            initial_virtual_token_reserves: config.initial_virtual_token_reserves,    
             initial_virtual_sui_reserves: config.initial_virtual_sui_reserves,
             initial_real_token_reserves: config.initial_real_token_reserves,
             token_total_supply: config.token_total_supply,
